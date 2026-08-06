@@ -22,6 +22,9 @@ concurrent tool execution, background memory sync, catalog fan-out,
 subagent timeout wrappers.  Do NOT use it for work that must complete
 before exit (durable writes) — those belong on foreground threads with
 explicit bounded joins.
+
+Compatible with CPython 3.8–3.13 (legacy ``_initializer`` attr) and
+3.14+ (``WorkerContext`` API).
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
     """ThreadPoolExecutor variant whose workers do not block process exit."""
 
     def _adjust_thread_count(self) -> None:
-        # Mirrors CPython's implementation (3.8–3.13) with two changes:
+        # Mirrors CPython's implementation (3.8–3.14) with two changes:
         # daemon=True and no _threads_queues registration.
         if self._idle_semaphore.acquire(timeout=0):
             return
@@ -49,16 +52,38 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         num_threads = len(self._threads)
         if num_threads < self._max_workers:
             thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            t = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
-                daemon=True,
-            )
+
+            # Python 3.14+: ThreadPoolExecutor uses WorkerContext API.
+            # _worker(executor_reference, ctx, work_queue)
+            # Prepare the context object for this new thread.
+            ctx = getattr(self, "_create_worker_context", None)
+            if ctx is not None:
+                # Python 3.14+ path: use WorkerContext
+                worker_ctx = ctx()
+                t = threading.Thread(
+                    name=thread_name,
+                    target=_worker,
+                    args=(
+                        weakref.ref(self, weakref_cb),
+                        worker_ctx,
+                        self._work_queue,
+                    ),
+                    daemon=True,
+                )
+            else:
+                # Python 3.8–3.13 path: _worker(weakref, work_queue, initializer, initargs)
+                initializer = getattr(self, "_initializer", None)
+                initargs = getattr(self, "_initargs", ())
+                t = threading.Thread(
+                    name=thread_name,
+                    target=_worker,
+                    args=(
+                        weakref.ref(self, weakref_cb),
+                        self._work_queue,
+                        initializer,
+                        initargs,
+                    ),
+                    daemon=True,
+                )
             t.start()
             self._threads.add(t)
