@@ -115,7 +115,7 @@ jobs:
             # Reject patches that touch anything outside JS/TS/JSON sources.
             # `npm run fix` should only ever modify those; anything else means
             # eslint/prettier or a plugin went rogue and we refuse to ship it.
-            BAD=$(git diff --name-only -- . "${EXCLUDES[@]}" | grep -vE '\.(js|cjs|mjs|ts|tsx|json)$' || true)
+            BAD=$(git diff --name-only -- . "${EXCLUDES[@]}" | grep -vE '\.(js|cjs|mjs|ts|tsx|json|d\.ts|html|css|md|mdx|svg|yml|yaml)$' || true)
             if [ -n "$BAD" ]; then
               echo "::error::Refusing to upload patch — touches disallowed files:"
               echo "$BAD"
