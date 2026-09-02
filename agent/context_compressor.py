@@ -33,6 +33,7 @@ from agent.auxiliary_client import (
     _is_connection_error,
     aux_interrupt_protection,
     call_llm,
+    extract_content_or_reasoning,
 )
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -151,19 +152,24 @@ _SUMMARY_MISSING_CREDENTIAL_MARKERS: tuple[str, ...] = (
     "no api key found",
 )
 
-_HYGIENE_IDLE_TIMEOUT_MARKERS: tuple[str, ...] = (
+_HYGIENE_PREAGENT_ONLY_COOLDOWN_MARKERS: tuple[str, ...] = (
     "session hygiene compression timed out",
+    "hygiene compression deferred: turn-hold budget expired",
 )
 
 
-def _is_hygiene_idle_timeout_error(error: object) -> bool:
-    """Return True when the durable cooldown came from a hygiene watchdog timeout.
+def _is_hygiene_preagent_only_cooldown(error: object) -> bool:
+    """Return True for a cooldown that belongs only to pre-agent hygiene.
 
-    That persist is intentional for the pre-agent hygiene pass (#74136) but
-    must not block the in-conversation compressor (#86972).
+    Hygiene watchdog timeouts and turn-hold deferrals intentionally persist
+    retry spacing for the pre-agent pass (#74136), but neither is evidence of
+    an auxiliary-model failure and neither may block the in-agent compressor
+    (#86972).
     """
     text = str(error or "").strip().casefold()
-    return any(marker in text for marker in _HYGIENE_IDLE_TIMEOUT_MARKERS)
+    return any(
+        marker in text for marker in _HYGIENE_PREAGENT_ONLY_COOLDOWN_MARKERS
+    )
 
 
 def _response_finish_reason(response: Any) -> str:
@@ -203,6 +209,20 @@ _TRUNCATED_SUMMARY_MARKER = "finish_reason=length"
 
 def _is_summary_access_or_quota_error(exc: Exception) -> bool:
     """Return True for non-retryable summary auth, permission, or quota errors."""
+
+    # A credential read that failed closed because no profile secret scope
+    # was active (multiplexed gateway, worker thread without the caller's
+    # ContextVars) is a missing-credential failure of our own making: the
+    # summary model cannot be reached until the spawn site is fixed, and a
+    # placeholder summary would only destroy the middle window for nothing.
+    # Classify it with the credential class so compress() preserves the
+    # session unchanged (#100849 bundle: every hygiene pass truncated).
+    try:
+        from agent.secret_scope import UnscopedSecretError
+    except Exception:  # pragma: no cover - import guard
+        UnscopedSecretError = ()  # type: ignore[assignment]
+    if UnscopedSecretError and isinstance(exc, UnscopedSecretError):
+        return True
 
     classified = classify_api_error(exc)
     if classified.reason is FailoverReason.rate_limit:
@@ -2166,7 +2186,7 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
         target = args.get("target", "?")
         return f"[memory] {action} on {target}"
 
-    if tool_name == "todo":
+    if tool_name == "todo_list":
         return "[todo] updated task list"
 
     if tool_name == "clarify":
@@ -2219,11 +2239,11 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
     if tool_name == "text_to_speech":
         return f"[text_to_speech] generated audio ({content_len:,} chars)"
 
-    if tool_name == "cronjob":
+    if tool_name == "cronjob_manage":
         action = args.get("action", "?")
         return f"[cronjob] {action}"
 
-    if tool_name == "process":
+    if tool_name == "process_manage":
         action = args.get("action", "?")
         sid = args.get("session_id", "?")
         return f"[process] {action} session={sid}"
@@ -2636,6 +2656,7 @@ class ContextCompressor(ContextEngine):
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
+        self._load_anti_thrash_recovery_deadline()
         self._load_proactive_prune_rearm_tokens()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
@@ -2800,6 +2821,45 @@ class ContextCompressor(ContextEngine):
             logger.debug("compression ineffective count persist failed: %s", exc)
         except Exception as exc:
             logger.debug("compression ineffective count persist failed (non-sqlite): %s", exc)
+
+    def _load_anti_thrash_recovery_deadline(self) -> None:
+        """Restore the durable recovery deadline (wall-clock epoch, #100185).
+
+        Missing/absent storage leaves the in-memory clock disarmed, so the
+        next blocked evaluation arms a full fresh window (#54923).
+        """
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        getter = getattr(session_db, "get_compression_recovery_deadline", None)
+        if not session_id or not callable(getter):
+            return
+        try:
+            stored = getter(session_id)
+            self._anti_thrash_recovery_deadline = max(
+                0.0,
+                float(stored) if isinstance(stored, (int, float, str)) else 0.0,
+            )
+        except (TypeError, ValueError, sqlite3.Error) as exc:
+            logger.debug("compression recovery deadline lookup failed: %s", exc)
+        except Exception as exc:
+            logger.debug("compression recovery deadline lookup failed (non-sqlite): %s", exc)
+
+    def _set_anti_thrash_recovery_deadline(self, deadline: float) -> None:
+        """Set the recovery deadline, persisting on change only (0 = disarmed)."""
+        if deadline == self._anti_thrash_recovery_deadline:
+            return
+        self._anti_thrash_recovery_deadline = deadline
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        setter = getattr(session_db, "set_compression_recovery_deadline", None)
+        if not session_id or not callable(setter):
+            return
+        try:
+            setter(session_id, deadline)
+        except sqlite3.Error as exc:
+            logger.debug("compression recovery deadline persist failed: %s", exc)
+        except Exception as exc:
+            logger.debug("compression recovery deadline persist failed (non-sqlite): %s", exc)
 
     def _record_ineffective_compression_verdict(self, count: int) -> None:
         """Set the anti-thrash strike counter, keeping the durable copy in sync.
@@ -2974,11 +3034,11 @@ class ContextCompressor(ContextEngine):
                 self._last_summary_error = None
             return None
 
-        # Hygiene idle-watchdog timeouts persist the same column so the
-        # pre-agent pass can skip (#74136), but they are not evidence of a
-        # 429/aux-model fault. The in-conversation compressor has its own
-        # budget and must still be allowed to run (#86972).
-        if _is_hygiene_idle_timeout_error(state.get("error")):
+        # Hygiene watchdog timeouts and turn-hold deferrals persist the same
+        # column so the pre-agent pass can skip (#74136), but they are not
+        # evidence of a 429/aux-model fault. The in-conversation compressor has
+        # its own budget and must still be allowed to run (#86972).
+        if _is_hygiene_preagent_only_cooldown(state.get("error")):
             # A later hygiene write can overwrite a previous aux-model row
             # on the shared column. Drop any in-memory cooldown so the
             # in-agent compressor is not still blocked after this refresh.
@@ -3315,10 +3375,20 @@ class ContextCompressor(ContextEngine):
         equal the ENTIRE window — auto-compression can never fire because the
         provider rejects the request before usage reaches 100% (#14690).
 
-        When the floor would meet or exceed the context window, trigger at
-        ``_MIN_CTX_TRIGGER_RATIO`` (85%) of the window — high enough that a
-        small model uses most of its context before compacting, but below
-        100% so compaction fires before the provider rejects the request.
+        Near-minimum windows degenerate the same way without ever tripping an
+        equality check: at ``context_length == 65536`` the floored threshold
+        used to pass through at 64,000 — 97.7% of the window, ~1.5K tokens of
+        output room. Providers that silently truncate over-window prompts
+        instead of rejecting them (e.g. ollama's OpenAI-compatible endpoint)
+        never deliver the reactive context-overflow backstop either, so a
+        session rides into the window ceiling and every length-continuation
+        retry re-sends a window-filling prompt for a shrinking sliver of
+        output. Whenever the floor is the binding term, it is therefore capped
+        at ``_MIN_CTX_TRIGGER_RATIO`` (85%) of the effective input budget —
+        high enough that a small model uses most of its context before
+        compacting, but low enough that compaction fires while output room
+        remains. An explicit ``threshold_percent`` above 85% is user intent,
+        not the floor, and is not capped.
 
         The provider reserves ``max_tokens`` of output space out of the same
         window, so the usable INPUT budget is ``context_length - max_tokens``.
@@ -3334,13 +3404,17 @@ class ContextCompressor(ContextEngine):
             effective_window = context_length
         pct_value = int(effective_window * threshold_percent)
         floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
-        # If flooring pushed the threshold to/over the effective window it can
-        # never be reached. Trigger at 85% of the effective input budget so a
-        # minimum-context model rides most of its budget before compacting
-        # instead of wasting half.
+        # The floor must not consume the window's output headroom: cap it at
+        # 85% of the effective input budget whenever it is the binding term.
+        # (An explicit threshold_percent above 85% is user intent — kept.)
+        trigger_cap = int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO)
+        if effective_window > 0 and floored > pct_value and floored > trigger_cap:
+            floored = max(pct_value, trigger_cap)
+        # If the percentage itself reaches the effective window it can never
+        # be reached — trigger at 85% of the window, below 100% so compaction
+        # fires before the provider rejects (or silently clips) the request.
         if effective_window > 0 and floored >= effective_window:
-            return max(1, min(int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO),
-                              effective_window - 1))
+            return max(1, min(trigger_cap, effective_window - 1))
         return floored
     def __init__(
         self,
@@ -3662,6 +3736,26 @@ class ContextCompressor(ContextEngine):
         self._verify_compaction_cleared_threshold = False
         self.awaiting_real_usage_after_compression = False
 
+    def maybe_seed_preflight_display_tokens(self, preflight_tokens: int) -> None:
+        """Seed ``last_prompt_tokens`` from a rough preflight estimate, display-only.
+
+        Policy (co-located with the rest of the speculative-seed lifecycle —
+        see ``snapshot_preflight_display_tokens`` /
+        ``rollback_interrupted_preflight_display_tokens``): seed ONLY from
+        the 0 state ("no reading yet", #34282). Any non-zero value is
+        preserved — the -1 post-compression sentinel (#36718) AND any real
+        provider reading (#81481: the rough estimate intentionally
+        over-counts CJK / reasoning replay, 1.4-2.5x on heavy sessions, and
+        must never overwrite a real measurement).
+
+        Accepted trade-off: a provider reporting partial usage (e.g.
+        excluding cache-discounted tokens) pins the meter low until its next
+        report — preferred over estimator inflation.
+        """
+        _last = self.last_prompt_tokens
+        if _last == 0 and preflight_tokens > _last:
+            self.last_prompt_tokens = preflight_tokens
+
     def snapshot_preflight_display_tokens(self) -> int:
         """Capture the display token count before a speculative preflight seed."""
         return self.last_prompt_tokens
@@ -3860,9 +3954,17 @@ class ContextCompressor(ContextEngine):
         except Exception as exc:
             logger.debug("compression ineffective-count refresh failed: %s", exc)
 
-    def _automatic_compression_blocked(self) -> bool:
-        """Return whether automatic compaction is in cooldown or tripped."""
-        if not self._automatic_compression_blocked_locally():
+    def _automatic_compression_blocked(self, *, ignore_cooldown: bool = False) -> bool:
+        """Return whether automatic compaction is in cooldown or tripped.
+
+        ``ignore_cooldown=True`` evaluates only the breakers that are NOT the
+        summary-failure cooldown. Used by provider-proven overflow recovery
+        (#100661): the provider already rejected the request, so waiting out
+        the cooldown just wedges the session — every turn defers and the next
+        failure extends the ladder. The overflow path gets one real attempt;
+        the ineffective/structural breakers still apply.
+        """
+        if not self._automatic_compression_blocked_locally(ignore_cooldown=ignore_cooldown):
             return False
         # Blocked on the in-memory snapshot. Durable guard rows may have
         # been cleared by another agent since bind_session_state() — a
@@ -3872,9 +3974,9 @@ class ContextCompressor(ContextEngine):
         # local block outlive the durable state that justified it. The
         # unblocked hot path above never pays for the DB reads.
         self._refresh_durable_guards()
-        return self._automatic_compression_blocked_locally()
+        return self._automatic_compression_blocked_locally(ignore_cooldown=ignore_cooldown)
 
-    def _automatic_compression_blocked_locally(self) -> bool:
+    def _automatic_compression_blocked_locally(self, *, ignore_cooldown: bool = False) -> bool:
         """Evaluate the automatic-compaction gate on in-memory state only."""
         # Do not trigger compression while the summary LLM is in cooldown.
         # On a 429/transient failure _generate_summary() sets a cooldown and
@@ -3886,7 +3988,7 @@ class ContextCompressor(ContextEngine):
         # force=True, which clears this cooldown in compress() before running,
         # so it still retries immediately.
         _cooldown_remaining = self._summary_failure_cooldown_until - time.monotonic()
-        if _cooldown_remaining > 0:
+        if _cooldown_remaining > 0 and not ignore_cooldown:
             if not self.quiet_mode:
                 logger.debug(
                     "Compression deferred — summary LLM in cooldown for %.0fs more",
@@ -3924,21 +4026,34 @@ class ContextCompressor(ContextEngine):
         # the worst case in the truly-incompressible state is one compaction
         # attempt per recovery window — bounded, not thrash.
         #
-        # The clock is armed lazily on the first BLOCKED evaluation rather
-        # than persisted at trip time: a fresh process that loads a durable
-        # tripped counter (#69872) therefore starts a full window blocked,
-        # preserving the restart-must-not-disarm contract (#54923).
+        # The clock is armed lazily on the first BLOCKED evaluation and
+        # persisted on the session row (#100185): a fresh process/compressor
+        # that loads a durable tripped counter (#69872) with no stored
+        # deadline starts a full window blocked, preserving the
+        # restart-must-not-disarm contract (#54923) — but one that loads an
+        # already-armed deadline resumes that window instead of restarting it.
         if (
             self._ineffective_compression_count >= 2
             or self._fallback_compression_streak >= 2
         ):
-            _now = time.monotonic()
-            if self._anti_thrash_recovery_deadline <= 0.0:
-                self._anti_thrash_recovery_deadline = (
+            # Wall clock, not monotonic: the deadline is persisted on the
+            # session row (#100185) so a fresh compressor bound to the same
+            # session — the gateway rebuilds the AIAgent on every cache
+            # eviction — resumes the SAME window instead of restarting it.
+            # Without that, a blocked messaging session never earned its
+            # probe and stayed blocked forever.
+            _now = time.time()
+            if self._anti_thrash_recovery_deadline <= 0.0 or (
+                # Clock jumped backwards past a full window: never wait
+                # longer than one window from now.
+                self._anti_thrash_recovery_deadline - _now
+                > self._ANTI_THRASH_RECOVERY_SECONDS
+            ):
+                self._set_anti_thrash_recovery_deadline(
                     _now + self._ANTI_THRASH_RECOVERY_SECONDS
                 )
             elif _now >= self._anti_thrash_recovery_deadline:
-                self._anti_thrash_recovery_deadline = 0.0
+                self._set_anti_thrash_recovery_deadline(0.0)
                 if self._ineffective_compression_count >= 2:
                     self._record_ineffective_compression_verdict(1)
                 if self._fallback_compression_streak >= 2:
@@ -3969,7 +4084,7 @@ class ContextCompressor(ContextEngine):
         # Guard not tripped (counters were cleared by an effective compaction
         # or a fitting real-usage reading) — disarm any pending recovery clock
         # so a LATER trip starts its own full window.
-        self._anti_thrash_recovery_deadline = 0.0
+        self._set_anti_thrash_recovery_deadline(0.0)
         return False
 
     # ------------------------------------------------------------------
@@ -4906,6 +5021,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
         memory_context: str = "",
+        bypass_cooldown: bool = False,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -4928,7 +5044,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if self._compression_cancelled():
             raise AuxiliaryExplicitCancellation()
         now = prompt_started_at
-        if now < self._summary_failure_cooldown_until:
+        # bypass_cooldown (#100661): provider-proven overflow gets ONE real
+        # summary attempt while the cooldown is armed; a failure below still
+        # records/extends the cooldown normally.
+        if now < self._summary_failure_cooldown_until and not bypass_cooldown:
             logger.debug(
                 "Skipping context summary during cooldown (%.0fs remaining)",
                 self._summary_failure_cooldown_until - now,
@@ -5307,22 +5426,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                 )
             if self._compression_cancelled():
                 raise AuxiliaryExplicitCancellation()
-            # ``_validate_llm_response`` only guarantees ``choices[0].message``
-            # exists, not that it's an object with ``.content``. Some
-            # OpenAI-compatible proxies / local backends return a dict- or
-            # str-shaped message; coerce defensively instead of crashing.
-            if isinstance(response, dict):
-                choices = response.get("choices") or [{}]
-                message = choices[0].get("message") if isinstance(choices[0], dict) else getattr(choices[0], "message", None)
-            else:
-                message = response.choices[0].message
-            if isinstance(message, dict):
-                content = message.get("content")
-            else:
-                content = getattr(message, "content", message)
-            # Handle cases where content is not a string (e.g., dict from llama.cpp)
-            if not isinstance(content, str):
-                content = str(content) if content else ""
+            # Dict/object/str messages + reasoning-field fallback (DeepSeek /
+            # Qwen / Kimi return content="" with the summary in
+            # reasoning_content). Cap the fallback so a CoT dump cannot
+            # become the compaction summary.
+            content = extract_content_or_reasoning(
+                response, max_reasoning_chars=8000
+            )
             # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels)
             # return a well-formed HTTP 200 with an empty or whitespace-only
             # ``content`` instead of an error or empty ``choices``. That payload
@@ -7631,6 +7741,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         focus_topic: Optional[str] = None,
         force: bool = False,
         memory_context: str = "",
+        bypass_cooldown: bool = False,
     ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
@@ -7667,6 +7778,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                 summary path.  Auto-compress callers pass False.
             memory_context: Optional provider-supplied context to preserve in
                 the summary prompt. Whitespace-only values are ignored.
+            bypass_cooldown: If True, run the summary LLM even while the
+                summary-failure cooldown is armed, WITHOUT clearing it
+                (#100661). Set by provider-proven overflow recovery, which
+                is already bounded by the caller's attempt budget.
         """
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
@@ -8004,6 +8119,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     turns_to_summarize,
                     focus_topic=summary_focus_topic,
                     memory_context=memory_context,
+                    bypass_cooldown=bypass_cooldown,
                 )
             except AuxiliaryExplicitCancellation:
                 # Explicit cancellation is a true no-op. Restore state mutated by
