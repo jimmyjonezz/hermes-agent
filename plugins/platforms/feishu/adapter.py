@@ -64,7 +64,8 @@ _LARK_SDK_IMPORTS = (
     ("lark_oapi.api.im.v1", (
         "CreateFileRequest", "CreateFileRequestBody", "CreateImageRequest", "CreateImageRequestBody",
         "CreateMessageRequest", "CreateMessageRequestBody", "GetChatRequest", "GetMessageRequest",
-        "GetMessageResourceRequest", "P2ImMessageMessageReadV1", "ReplyMessageRequest", "ReplyMessageRequestBody",
+        "DeleteMessageRequest", "GetMessageResourceRequest", "P2ImMessageMessageReadV1",
+        "ReplyMessageRequest", "ReplyMessageRequestBody",
         "UpdateMessageRequest", "UpdateMessageRequestBody",
     )),
     ("lark_oapi.core", ("AccessTokenType", "HttpMethod")),
@@ -1723,6 +1724,24 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a bot-posted message (used by stream-consumer preview cleanup)."""
+        if not self._client or not message_id:
+            return False
+        try:
+            request = self._build_delete_message_request(message_id)
+            response = await self._run_blocking(self._client.im.v1.message.delete, request)
+            if self._response_succeeded(response):
+                return True
+            logger.debug(
+                "[Feishu] Delete of message %s rejected: code=%s msg=%s",
+                message_id, getattr(response, "code", None), getattr(response, "msg", None),
+            )
+            return False
+        except Exception:
+            logger.debug("[Feishu] Failed to delete message %s", message_id, exc_info=True)
+            return False
+
     # Template attrs for the shared _format_exec_approval core. The card
     # header carries the title, so the text core starts at the code fence.
     _EA_HEADER = ""
@@ -2588,7 +2607,10 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        # Only a native ``thread_id`` marks a topic. ``root_id`` is present on every quoted reply
+        # too, so using it as a fallback (#19711) turned ordinary quote replies into topic
+        # sessions and pushed the bot's answer into a fresh thread (#20548).
+        thread_id = getattr(message, "thread_id", None) or None
         reply_to_message_id = (
             getattr(message, "parent_id", None) or getattr(message, "upper_message_id", None)
             or getattr(message, "root_id", None) or None
@@ -3969,6 +3991,10 @@ class FeishuAdapter(BasePlatformAdapter):
     @staticmethod
     def _build_update_message_request(message_id: str, request_body: Any) -> Any:
         return _sdk_build(UpdateMessageRequest, message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_delete_message_request(message_id: str) -> Any:
+        return _sdk_build(DeleteMessageRequest, message_id=message_id)
 
     @staticmethod
     def _build_create_message_body(*, receive_id: str, msg_type: str, content: str, uuid_value: str) -> Any:
